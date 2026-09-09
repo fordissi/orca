@@ -152,6 +152,27 @@ it('drops a file whose parser returned no session', async () => {
   expect(cursor()).toBe(300)
 })
 
+it('stages nothing for a source whose parser cannot reach the channel', async () => {
+  // An OpenCode SQLite candidate decodes in a worker, so every read of it is
+  // incomplete; opening a batch per scan would tombstone rows forever.
+  const candidate = {
+    ...syntheticCandidate({ path: '/opencode/opencode.db#session-1' }),
+    agent: 'opencode' as const
+  }
+  replayTranscriptRead({
+    candidate,
+    messages: [],
+    outcome: { byteOffset: 0, incomplete: true }
+  })
+  await store.settled()
+
+  expect(index.db.prepare('SELECT count(*) AS n FROM sessions').get()).toEqual({ n: 0 })
+  expect(index.db.prepare('SELECT count(*) AS n FROM search_pending_deletes').get()).toEqual({
+    n: 0
+  })
+  expect(store.takeStale()).toEqual([])
+})
+
 it('ignores a candidate older than the retention cutoff', async () => {
   store.setRetentionCutoffMs(Date.now())
   replayTranscriptRead({ messages: userMessages('too old', 3) })

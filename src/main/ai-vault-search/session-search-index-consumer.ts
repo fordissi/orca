@@ -1,3 +1,4 @@
+import { parserPublishesMessages } from '../ai-vault/session-scanner-agent-parser'
 import {
   registerTranscriptConsumer,
   type TranscriptConsumer,
@@ -29,6 +30,12 @@ export class SessionSearchIndexConsumer implements TranscriptConsumer {
   beginRead(start: TranscriptReadStart): TranscriptReadConsumer | null {
     const { candidate } = start
     if (!this.store.acceptsCandidate(candidate)) {
+      return null
+    }
+    // A parser that decodes where the channel cannot reach it reports every read
+    // as incomplete. Declining here is not the same as being behind: no re-read
+    // would help, so the file is not recorded either.
+    if (!parserPublishesMessages(candidate)) {
       return null
     }
     if (start.mode === 'append') {

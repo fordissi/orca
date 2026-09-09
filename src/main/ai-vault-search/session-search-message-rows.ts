@@ -5,6 +5,15 @@ import { redactSessionSearchText } from './session-search-redaction'
 
 const CHUNK_TARGET_CHARS = 8000
 
+declare const redactedRow: unique symbol
+
+/**
+ * A row whose text has been through `redactSessionSearchText`. Only
+ * `searchMessageRows` can mint one, so no insert site can reach an FTS table
+ * with raw transcript text.
+ */
+export type RedactedMessageRow = TranscriptMessage & { readonly [redactedRow]: true }
+
 function* textChunks(text: string): Generator<string> {
   if (text.length <= CHUNK_TARGET_CHARS) {
     yield text
@@ -24,13 +33,21 @@ function* textChunks(text: string): Generator<string> {
   }
 }
 
-/** One message becomes N rows: FTS5 ranks a short row far better than a huge one. */
+/**
+ * One message becomes N rows: FTS5 ranks a short row far better than a huge one.
+ *
+ * Redaction happens here, over the whole message, before it is cut up. A
+ * credential is a shape, and a shape split across two chunks matches neither
+ * half: redacting per chunk indexed any PEM block or JWT that straddled the
+ * boundary in full, identifier shadow terms included.
+ */
 export function* searchMessageRows(
   messages: Iterable<TranscriptMessage>
-): Generator<TranscriptMessage> {
+): Generator<RedactedMessageRow> {
   for (const message of messages) {
-    for (const text of textChunks(message.text)) {
-      yield { ...message, text }
+    const redacted = redactSessionSearchText(message.text)
+    for (const text of textChunks(redacted)) {
+      yield { ...message, text } as RedactedMessageRow
     }
   }
 }
@@ -45,9 +62,9 @@ export function insertSearchMessage(
   db: SyncDatabase,
   sessionId: number,
   batchId: number,
-  message: TranscriptMessage
+  message: RedactedMessageRow
 ): void {
-  const text = redactSessionSearchText(message.text)
+  const text = message.text
   const id = db
     .prepare('INSERT INTO messages(session_row_id, batch_id, role, ts) VALUES (?, ?, ?, ?)')
     .run(sessionId, batchId, message.role, message.timestamp).lastInsertRowid

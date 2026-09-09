@@ -10,7 +10,11 @@ import type {
   SessionSearchIndexedFile
 } from './session-search-file-cursor'
 import { SessionSearchFileRecords } from './session-search-file-records'
-import { insertSearchMessage, searchMessageRows } from './session-search-message-rows'
+import {
+  insertSearchMessage,
+  searchMessageRows,
+  type RedactedMessageRow
+} from './session-search-message-rows'
 import { discardSearchBatch, retireSearchSession } from './session-search-pending-deletes'
 import { assertSearchWalBudget, SEARCH_WAL_PENDING_BYTES } from './session-search-wal-budget'
 
@@ -51,8 +55,12 @@ export type SessionSearchStagedWrite = {
 
 export class SessionSearchIndexWriter {
   private readonly records: SessionSearchFileRecords
-  // One open stage per path: reads of one transcript are serialized by the
-  // parse file lane, so this only ever tracks the read in flight.
+  // One open stage per path. Reads of one transcript are serialized by the parse
+  // file lane, so this only ever tracks the read in flight; `removeFile` can
+  // therefore invalidate the open stage by path. If the lane is ever bypassed,
+  // the later stage takes the slot and the earlier one loses its invalidation
+  // hook, but it still cannot publish: `publishable` re-reads the cursor and
+  // refuses. Both halves are pinned in session-search-index-writer.test.ts.
   private readonly staging = new Map<string, { invalidated: boolean }>()
 
   constructor(
@@ -155,7 +163,7 @@ export class SessionSearchIndexWriter {
 
     const open = { invalidated: false }
     this.staging.set(path, open)
-    const buffer: TranscriptMessage[] = []
+    const buffer: RedactedMessageRow[] = []
     let bufferedChars = 0
     let steps = 0
 

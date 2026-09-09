@@ -259,3 +259,38 @@ it('publishes the session metadata the read decoded', async () => {
     resume_command: 'claude --resume abc-123'
   })
 })
+
+it('keeps a proven file identity when a later read cannot stat it', async () => {
+  const withIdentity = syntheticCandidate({ dev: 1, ino: 10 })
+  replayTranscriptRead({
+    candidate: withIdentity,
+    messages: userMessages('first', 2),
+    outcome: { byteOffset: 100 }
+  })
+  await store.settled()
+
+  // A host that cannot prove identity re-reads the same file.
+  replayTranscriptRead({
+    candidate: syntheticCandidate(),
+    mode: 'append',
+    previousByteOffset: 100,
+    messages: userMessages('second', 2),
+    outcome: { byteOffset: 200 }
+  })
+  await store.settled()
+  expect(visibleMessages()).toBe(4)
+
+  // The stored identity survived, so a rename-replace is still detectable.
+  replayTranscriptRead({
+    candidate: syntheticCandidate({ dev: 1, ino: 99 }),
+    mode: 'append',
+    previousByteOffset: 200,
+    messages: userMessages('replacement', 2),
+    outcome: { byteOffset: 300 }
+  })
+  await store.settled()
+
+  expect(visibleMessages()).toBe(4)
+  expect(cursor()).toBe(200)
+  expect(store.takeStale()).toHaveLength(1)
+})

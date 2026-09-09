@@ -57,7 +57,11 @@ export class SessionSearchFileRecords {
       .prepare(
         `INSERT INTO files(path, dev, ino, byte_offset, mtime_ms, size_bytes, session_row_id)
          VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(path) DO UPDATE SET dev = excluded.dev, ino = excluded.ino,
+         ON CONFLICT(path) DO UPDATE SET
+           -- Why COALESCE: a host that cannot stat dev/ino (SSH, WSL, a degraded
+           -- Windows stat) must not erase an identity an earlier scan proved, or
+           -- the next rename-replace of this path becomes undetectable.
+           dev = COALESCE(excluded.dev, files.dev), ino = COALESCE(excluded.ino, files.ino),
            byte_offset = excluded.byte_offset, mtime_ms = excluded.mtime_ms,
            size_bytes = excluded.size_bytes, session_row_id = excluded.session_row_id`
       )

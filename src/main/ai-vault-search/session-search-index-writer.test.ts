@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, it } from 'vitest'
 import { SessionSearchIndexConsumer } from './session-search-index-consumer'
+import { SessionSearchIndexWriter } from './session-search-index-writer'
 import {
   openSessionSearchIndexFile,
   syntheticCandidate,
@@ -123,4 +124,39 @@ it('declines a behind cursor in beginRead before it ever reaches the store', () 
     consumer.beginRead({ candidate: syntheticCandidate(), mode: 'append', previousByteOffset: 100 })
   ).not.toBeNull()
   expect(attempted).toEqual([100])
+})
+
+it('treats half a recorded identity as no identity at all', async () => {
+  // A host that could stat dev but not ino: `remote-session-file-stat` spreads
+  // the two independently, and `upsertFile` preserves the half it was given.
+  const partial = { ...syntheticCandidate({ dev: 7 }), agent: 'claude' as const }
+  const staged = store.beginWrite(partial, 'replace', 0)!
+  for (const message of userMessages('halfidentity', 2)) {
+    staged.add(message)
+  }
+  staged.publish({ session: syntheticSession(), byteOffset: 100, incomplete: false })
+  staged.discard()
+  expect(index.db.prepare('SELECT dev, ino FROM files').get()).toEqual({ dev: 7, ino: null })
+
+  // One matching number is not proof of sameness, and one mismatching number is
+  // not proof of replacement. Neither compares, so neither declines.
+  expect(store.indexedFile(SYNTHETIC_TRANSCRIPT, { dev: 7, ino: 99 })?.byteOffset).toBe(100)
+  expect(store.indexedFile(SYNTHETIC_TRANSCRIPT, { dev: 8, ino: 99 })?.byteOffset).toBe(100)
+  expect(store.beginWrite(syntheticCandidate({ dev: 8, ino: 99 }), 'append', 100)).not.toBeNull()
+})
+
+it('forgets a finished read rather than growing a stage per path', () => {
+  const writer = new SessionSearchIndexWriter(index.db)
+  for (const path of ['/a.jsonl', '/b.jsonl', '/a.jsonl']) {
+    const staged = writer.beginWrite(syntheticCandidate({ path }), 'replace', 0)!
+    staged.add(userMessages('leakcheck', 1)[0])
+    staged.publish({ session: syntheticSession(), byteOffset: 10, incomplete: false })
+    staged.discard()
+    expect(writer.openStageCount).toBe(0)
+  }
+  // An abandoned read is still a finished one once it is discarded.
+  const abandoned = writer.beginWrite(syntheticCandidate({ path: '/c.jsonl' }), 'replace', 0)!
+  expect(writer.openStageCount).toBe(1)
+  abandoned.discard()
+  expect(writer.openStageCount).toBe(0)
 })

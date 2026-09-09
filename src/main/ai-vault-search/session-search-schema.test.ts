@@ -156,6 +156,28 @@ it('gives up rather than looping when a fresh file still cannot be opened', asyn
   }
 })
 
+it('surfaces the unlink failure itself when a stale index cannot be removed', async () => {
+  const path = await tempDatabasePath()
+  const stale = openSessionSearchDatabase(path)
+  stale
+    .prepare("UPDATE meta SET value = ? WHERE key = 'schema_version'")
+    .run(String(SESSION_SEARCH_SCHEMA_VERSION + 1))
+  stale.close()
+  recordedRmSync.mockReset()
+  recordedRmSync.mockImplementation(() => {
+    throw Object.assign(new Error('EPERM: operation not permitted, unlink'), { code: 'EPERM' })
+  })
+  try {
+    // The stale handle is closed before the unlink, so the failure path must not
+    // close it again: ERR_INVALID_STATE would bury the cause and would not be
+    // classified as worth a rebuild.
+    expect(() => openSessionSearchDatabase(path)).toThrow(/EPERM/)
+    expect(() => openSessionSearchDatabase(path)).not.toThrow(/not open/)
+  } finally {
+    recordedRmSync.mockReset()
+  }
+})
+
 it('rebuilds a newer index rather than reading a schema it does not know', async () => {
   const path = await tempDatabasePath()
   const newer = openSessionSearchDatabase(path)

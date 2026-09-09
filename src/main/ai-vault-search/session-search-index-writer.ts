@@ -70,6 +70,11 @@ export class SessionSearchIndexWriter {
     this.records = new SessionSearchFileRecords(db)
   }
 
+  /** Tests only: an entry surviving a finished read leaks for the store's life. */
+  get openStageCount(): number {
+    return this.staging.size
+  }
+
   /** This index's own cursor, or null when the file is unknown or its identity changed. */
   indexedFile(path: string, identity: SessionSearchFileIdentity): SessionSearchIndexedFile | null {
     const row = this.db
@@ -82,6 +87,13 @@ export class SessionSearchIndexWriter {
     }
     // A recorded identity that no longer matches is a different file at the same
     // path; the rows describe the old one.
+    //
+    // Half an identity is no identity: `remote-session-file-stat` spreads dev and
+    // ino independently, so a host can record one without the other, and the
+    // COALESCE in `upsertFile` now preserves that half across a later read. One
+    // number cannot tell a rename-replace from a same-file re-read, so comparing
+    // it would decline healthy resumes on the strength of a coincidence, and
+    // `fileIdentity` refuses to build a half identity for the same reason.
     if (identity && row.dev !== null && row.ino !== null) {
       if (row.dev !== identity.dev || row.ino !== identity.ino) {
         return null

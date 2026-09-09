@@ -9,30 +9,57 @@ import { VISIBLE_MESSAGES, VISIBLE_SESSIONS } from './session-search-schema'
 // holds staged and tombstoned rows, and only the views subtract them. Every read
 // site has to join one, and nothing in SQL can force that.
 //
-// The unit is the file, not the statement: `'SELECT rowid FROM ' + table` and a
-// `${TABLE}` interpolation both hide the table name from any per-literal scan.
+// The unit is one SQL statement, not one file. A file is far too coarse: the
+// query module this exists for will name both views somewhere, and that would
+// whitelist every raw read in it.
 
 const FTS_TABLE = /\b(?:messages_fts|conversation_fts)\b/
 const SELECT = /\bSELECT\b/i
 const VISIBLE_VIEW = new RegExp(
   `\\b(?:${VISIBLE_MESSAGES}|${VISIBLE_SESSIONS}|VISIBLE_MESSAGES|VISIBLE_SESSIONS)\\b`
 )
+// A table name this scan cannot read: `FROM ' + table` or `FROM ${table}`.
+const DYNAMIC_TABLE = /\b(?:FROM|JOIN)\s*(?:\$\{|$)/i
+// A literal, plus any literals concatenated onto it: one statement, not several.
+const SQL_FRAGMENT =
+  /(?:`(?:[^`\\]|\\[\s\S])*`|'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*")(?:\s*\+\s*(?:`(?:[^`\\]|\\[\s\S])*`|'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"))*/g
+
+/** Statement-sized spans of SQL text, with the quotes and the `+` joins removed. */
+export function sqlStatements(source: string): string[] {
+  const statements: string[] = []
+  for (const [fragment] of source.matchAll(SQL_FRAGMENT)) {
+    const sql = fragment
+      .split(/\s*\+\s*/)
+      .map((part) => part.slice(1, -1))
+      .join('')
+    statements.push(...sql.split(';'))
+  }
+  return statements
+}
 
 /**
- * Modules that name an FTS table next to a SELECT without reading published
- * rows. Every entry needs a reason, and the census below fails on an entry that
- * has stopped being necessary.
+ * Reads that could return a staged or tombstoned row. A statement whose table
+ * name is assembled at runtime counts only in a file that names an FTS table
+ * somewhere, which is the shape a concatenated or interpolated read takes.
  */
-// The schema module is not here: it names both views while declaring them, so
-// it satisfies the rule outright rather than needing an exemption.
-const ALLOWED: Record<string, string> = {
-  'session-search-retention-delete.ts':
-    'deletes by rowid, and deliberately reaches staged and tombstoned rows'
+export function unguardedFtsReads(source: string): string[] {
+  const fileNamesFts = FTS_TABLE.test(source)
+  return sqlStatements(source).filter((statement) => {
+    if (!SELECT.test(statement) || VISIBLE_VIEW.test(statement)) {
+      return false
+    }
+    return FTS_TABLE.test(statement) || (fileNamesFts && DYNAMIC_TABLE.test(statement))
+  })
 }
 
-export function readsFtsWithoutView(text: string): boolean {
-  return FTS_TABLE.test(text) && SELECT.test(text) && !VISIBLE_VIEW.test(text)
-}
+/**
+ * Statements that read an FTS table without subtracting staged rows and are
+ * allowed to. Every entry needs a reason, and the census fails on one that has
+ * stopped being necessary.
+ */
+const ALLOWED: Record<string, string> = {}
+
+const ROOTS = ['src/main', 'src/relay', 'src/cli', 'src/shared', 'src/preload']
 
 async function sourceFiles(root: string): Promise<{ name: string; text: string }[]> {
   const out: { name: string; text: string }[] = []
@@ -57,45 +84,70 @@ async function sourceFiles(root: string): Promise<{ name: string; text: string }
   return out
 }
 
-it('flags the shapes a per-statement scan would miss', () => {
-  const literal = String.raw`db.prepare('SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?')`
-  expect(readsFtsWithoutView(literal)).toBe(true)
-
-  // Concatenation: the table name never appears inside the SELECT literal.
-  const concatenated = String.raw`const t = 'messages_fts'; db.prepare('SELECT rowid FROM ' + t)`
-  expect(readsFtsWithoutView(concatenated)).toBe(true)
-
-  // Interpolation: same, through a template.
-  const interpolated = String.raw`const TABLE = 'conversation_fts'; db.prepare(\`SELECT rowid FROM ${'${TABLE}'}\`)`
-  expect(readsFtsWithoutView(interpolated)).toBe(true)
-
-  const joined = String.raw`db.prepare(\`SELECT s.id FROM conversation_fts
-    JOIN visible_messages m ON m.id = conversation_fts.rowid\`)`
-  expect(readsFtsWithoutView(joined)).toBe(false)
-
-  // A module that only deletes from an FTS table is not a read site.
+it('flags a raw read and the two shapes that hide the table name', () => {
   expect(
-    readsFtsWithoutView(String.raw`db.prepare('DELETE FROM messages_fts WHERE rowid = ?')`)
-  ).toBe(false)
+    unguardedFtsReads(
+      String.raw`db.prepare('SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?')`
+    )
+  ).toHaveLength(1)
+
+  // Concatenated: the table name is never inside the SELECT literal.
+  expect(
+    unguardedFtsReads(String.raw`const t = 'messages_fts'; db.prepare('SELECT rowid FROM ' + t)`)
+  ).toHaveLength(1)
+
+  // Interpolated: same, through a template.
+  expect(
+    unguardedFtsReads(
+      // A plain double-quoted string, so the ${...} reaches the checker verbatim.
+      "const TABLE = 'conversation_fts'; db.prepare(`SELECT rowid FROM ${TABLE}`)"
+    )
+  ).toHaveLength(1)
+
+  // Concatenated literals are one statement, so the join is seen.
+  expect(
+    unguardedFtsReads(
+      String.raw`db.prepare('SELECT rowid FROM messages_fts JOIN ' + 'visible_messages m ON m.id = rowid')`
+    )
+  ).toEqual([])
 })
 
-it('reads every FTS table through a visibility view across main and relay', async () => {
-  const roots = ['src/main', 'src/relay']
-  const files = (await Promise.all(roots.map((root) => sourceFiles(root)))).flat()
+it('flags a raw read in a file that names a view somewhere else entirely', () => {
+  // The shape a file-level scan cannot see: the view name is real, but it is in
+  // an unrelated string, so it guards nothing.
+  const source = String.raw`
+    const LABEL = 'visible_messages is the published half'
+    export function hits(db: Db) {
+      return db.prepare('SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?').all()
+    }
+  `
+  const offenders = unguardedFtsReads(source)
+  expect(offenders).toHaveLength(1)
+  expect(offenders[0]).toContain('messages_fts')
+})
+
+it('leaves a joined read alone even next to a raw table name in a delete', () => {
+  const source = String.raw`
+    const purge = db.prepare('DELETE FROM messages_fts WHERE rowid = ?')
+    const read = db.prepare('SELECT m.id FROM conversation_fts JOIN visible_messages m ON m.id = conversation_fts.rowid')
+  `
+  expect(unguardedFtsReads(source)).toEqual([])
+})
+
+it('reads every FTS table through a visibility view across every bundled root', async () => {
+  const files = (await Promise.all(ROOTS.map((root) => sourceFiles(root)))).flat()
   expect(files.length).toBeGreaterThan(500)
   // The scan really reaches the modules that name these tables.
-  expect(files.filter((file) => FTS_TABLE.test(file.text)).length).toBeGreaterThanOrEqual(
-    Object.keys(ALLOWED).length
-  )
+  expect(files.some((file) => FTS_TABLE.test(file.text))).toBe(true)
 
   const offenders = files
-    .filter((file) => readsFtsWithoutView(file.text) && !(file.name in ALLOWED))
+    .filter((file) => unguardedFtsReads(file.text).length > 0 && !(file.name in ALLOWED))
     .map((file) => file.name)
   expect(offenders).toEqual([])
 
   // A stale exemption is an unguarded read waiting to happen.
   const unused = Object.keys(ALLOWED).filter(
-    (name) => !files.some((file) => file.name === name && readsFtsWithoutView(file.text))
+    (name) => !files.some((file) => file.name === name && unguardedFtsReads(file.text).length > 0)
   )
   expect(unused).toEqual([])
 })

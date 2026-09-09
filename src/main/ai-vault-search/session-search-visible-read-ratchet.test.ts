@@ -8,68 +8,94 @@ import { VISIBLE_MESSAGES, VISIBLE_SESSIONS } from './session-search-schema'
 // FTS rows — those land in the staging flushes. An FTS table on its own still
 // holds staged and tombstoned rows, and only the views subtract them. Every read
 // site has to join one, and nothing in SQL can force that.
+//
+// The unit is the file, not the statement: `'SELECT rowid FROM ' + table` and a
+// `${TABLE}` interpolation both hide the table name from any per-literal scan.
 
-const FTS_TABLES = /\b(?:messages_fts|conversation_fts)\b/
-// The view by its resolved name or by the constant a module interpolates.
+const FTS_TABLE = /\b(?:messages_fts|conversation_fts)\b/
+const SELECT = /\bSELECT\b/i
 const VISIBLE_VIEW = new RegExp(
   `\\b(?:${VISIBLE_MESSAGES}|${VISIBLE_SESSIONS}|VISIBLE_MESSAGES|VISIBLE_SESSIONS)\\b`
 )
-const STRING_LITERAL = /`(?:[^`\\]|\\[\s\S])*`|'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"/g
 
-/** SQL literals in `source` that read an FTS table without subtracting staged rows. */
-export function unguardedFtsReads(source: string): string[] {
-  const offenders: string[] = []
-  for (const [literal] of source.matchAll(STRING_LITERAL)) {
-    if (!/\bSELECT\b/i.test(literal) || !FTS_TABLES.test(literal)) {
-      continue
-    }
-    if (!VISIBLE_VIEW.test(literal)) {
-      offenders.push(literal.replaceAll(/\s+/g, ' ').slice(0, 120))
+/**
+ * Modules that name an FTS table next to a SELECT without reading published
+ * rows. Every entry needs a reason, and the census below fails on an entry that
+ * has stopped being necessary.
+ */
+// The schema module is not here: it names both views while declaring them, so
+// it satisfies the rule outright rather than needing an exemption.
+const ALLOWED: Record<string, string> = {
+  'session-search-retention-delete.ts':
+    'deletes by rowid, and deliberately reaches staged and tombstoned rows'
+}
+
+export function readsFtsWithoutView(text: string): boolean {
+  return FTS_TABLE.test(text) && SELECT.test(text) && !VISIBLE_VIEW.test(text)
+}
+
+async function sourceFiles(root: string): Promise<{ name: string; text: string }[]> {
+  const out: { name: string; text: string }[] = []
+  const walk = async (dir: string): Promise<void> => {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name)
+      if (entry.isDirectory()) {
+        await walk(path)
+        continue
+      }
+      if (
+        !entry.name.endsWith('.ts') ||
+        entry.name.endsWith('.test.ts') ||
+        entry.name.endsWith('-test-fixture.ts')
+      ) {
+        continue
+      }
+      out.push({ name: entry.name, text: await readFile(path, 'utf-8') })
     }
   }
-  return offenders
+  await walk(root)
+  return out
 }
 
-async function productionSources(): Promise<{ name: string; text: string }[]> {
-  const dir = import.meta.dirname
-  const names = (await readdir(dir)).filter(
-    (name) =>
-      name.endsWith('.ts') && !name.endsWith('.test.ts') && !name.endsWith('-test-fixture.ts')
-  )
-  return Promise.all(
-    names.map(async (name) => ({ name, text: await readFile(join(dir, name), 'utf-8') }))
-  )
-}
+it('flags the shapes a per-statement scan would miss', () => {
+  const literal = String.raw`db.prepare('SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?')`
+  expect(readsFtsWithoutView(literal)).toBe(true)
 
-it('flags a read of an FTS table that does not subtract staged rows', () => {
-  const bare = String.raw`db.prepare('SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?')`
-  expect(unguardedFtsReads(bare)).toHaveLength(1)
+  // Concatenation: the table name never appears inside the SELECT literal.
+  const concatenated = String.raw`const t = 'messages_fts'; db.prepare('SELECT rowid FROM ' + t)`
+  expect(readsFtsWithoutView(concatenated)).toBe(true)
+
+  // Interpolation: same, through a template.
+  const interpolated = String.raw`const TABLE = 'conversation_fts'; db.prepare(\`SELECT rowid FROM ${'${TABLE}'}\`)`
+  expect(readsFtsWithoutView(interpolated)).toBe(true)
 
   const joined = String.raw`db.prepare(\`SELECT s.id FROM conversation_fts
-    JOIN visible_messages m ON m.id = conversation_fts.rowid
-    WHERE conversation_fts MATCH ?\`)`
-  expect(unguardedFtsReads(joined)).toEqual([])
+    JOIN visible_messages m ON m.id = conversation_fts.rowid\`)`
+  expect(readsFtsWithoutView(joined)).toBe(false)
 
-  // A delete is not a read: retention removes staged rows on purpose.
+  // A module that only deletes from an FTS table is not a read site.
   expect(
-    unguardedFtsReads(String.raw`db.prepare('DELETE FROM messages_fts WHERE rowid = ?')`)
-  ).toEqual([])
-  // Two statements in one file must not blur into one match.
-  expect(
-    unguardedFtsReads(
-      String.raw`db.prepare('SELECT path FROM files'); db.prepare('INSERT INTO messages_fts(rowid) VALUES (?)')`
-    )
-  ).toEqual([])
+    readsFtsWithoutView(String.raw`db.prepare('DELETE FROM messages_fts WHERE rowid = ?')`)
+  ).toBe(false)
 })
 
-it('reads every FTS table through a visibility view across the index modules', async () => {
-  const sources = await productionSources()
-  expect(sources.length).toBeGreaterThan(10)
-  // Pointed at the real corpus, so a query module is covered the moment it lands.
-  expect(sources.some((file) => FTS_TABLES.test(file.text))).toBe(true)
-
-  const offenders = sources.flatMap((file) =>
-    unguardedFtsReads(file.text).map((statement) => `${file.name}: ${statement}`)
+it('reads every FTS table through a visibility view across main and relay', async () => {
+  const roots = ['src/main', 'src/relay']
+  const files = (await Promise.all(roots.map((root) => sourceFiles(root)))).flat()
+  expect(files.length).toBeGreaterThan(500)
+  // The scan really reaches the modules that name these tables.
+  expect(files.filter((file) => FTS_TABLE.test(file.text)).length).toBeGreaterThanOrEqual(
+    Object.keys(ALLOWED).length
   )
+
+  const offenders = files
+    .filter((file) => readsFtsWithoutView(file.text) && !(file.name in ALLOWED))
+    .map((file) => file.name)
   expect(offenders).toEqual([])
+
+  // A stale exemption is an unguarded read waiting to happen.
+  const unused = Object.keys(ALLOWED).filter(
+    (name) => !files.some((file) => file.name === name && readsFtsWithoutView(file.text))
+  )
+  expect(unused).toEqual([])
 })

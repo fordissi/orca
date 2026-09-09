@@ -10,7 +10,6 @@ import {
   type SessionSearchStagedWrite
 } from './session-search-index-writer'
 import { warmSessionSearchPages } from './session-search-page-warmup'
-import { recoverSearchWrites } from './session-search-pending-deletes'
 import { deleteExpiredSearchFiles } from './session-search-retention-delete'
 import { openSessionSearchDatabase } from './session-search-schema'
 
@@ -49,7 +48,6 @@ export class SessionSearchStore {
     options: SessionSearchStoreOptions = {}
   ) {
     this.db = openSessionSearchDatabase(path)
-    recoverSearchWrites(this.db)
     this.writer = new SessionSearchIndexWriter(this.db, options.walBudgetBytes)
   }
 
@@ -174,6 +172,12 @@ export class SessionSearchStore {
     }
   }
 
+  /**
+   * Reads the messages table through so its pages are warm before the first
+   * query joins against it. Nothing calls this yet: there is no query to warm
+   * for, and warming the FTS pages is the query engine's call to make once it
+   * knows which of them it touches.
+   */
   warm(): Promise<void> {
     this.warmed ??= warmSessionSearchPages(this.db, () => this.closed).catch((error) =>
       this.onError(error)

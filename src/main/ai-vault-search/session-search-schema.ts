@@ -1,5 +1,6 @@
 import SyncDatabase from '../sqlite/sync-database'
 import { removeTreeSync } from '../../shared/windows-transient-lock-removal'
+import { recoverSearchWrites } from './session-search-pending-deletes'
 
 // Bump to drop and rebuild: the index is a cache over the transcripts, never a source.
 export const SESSION_SEARCH_SCHEMA_VERSION = 1
@@ -21,7 +22,9 @@ CREATE TABLE IF NOT EXISTS sessions(
   index_ready INTEGER NOT NULL DEFAULT 1,
   agent TEXT NOT NULL,
   session_id TEXT NOT NULL,
-  -- Not unique: OpenCode/Cursor SQLite sessions share one store path; files.path is the key.
+  -- The transcript this session was decoded from. Not unique: OpenCode's SQLite
+  -- sessions all report the store's own path here, while files.path holds the
+  -- synthetic db#sessionId candidate that really is one per session.
   file_path TEXT NOT NULL,
   codex_home TEXT,
   title TEXT NOT NULL,
@@ -49,6 +52,8 @@ CREATE TABLE IF NOT EXISTS files(
   size_bytes INTEGER,
   session_row_id INTEGER
 );
+-- Retention walks the expiring end of this column; without it that is a full scan and a sort.
+CREATE INDEX IF NOT EXISTS files_mtime ON files(mtime_ms);
 CREATE TABLE IF NOT EXISTS search_pending_deletes(
   path TEXT PRIMARY KEY,
   session_row_id INTEGER NOT NULL,
@@ -85,22 +90,67 @@ CREATE VIEW IF NOT EXISTS ${VISIBLE_MESSAGES} AS SELECT * FROM messages
   WHERE batch_id IS NULL;
 `
 
+/**
+ * Opens the index, rebuilding it whenever what is on disk cannot be trusted:
+ * a different schema version, a version SQLite cannot report, or a file torn
+ * badly enough that opening or recovery fails. The index is a cache over the
+ * transcripts, so throwing away a bad one costs a re-scan and nothing else;
+ * refusing to open would strand the feature until a human deleted the file.
+ */
 export function openSessionSearchDatabase(path: string): SyncDatabase {
-  let db = openWithPragmas(path)
-  const version = readSchemaVersion(db)
-  if (version !== null && version !== SESSION_SEARCH_SCHEMA_VERSION) {
-    // Why: DROP TABLE on a multi-GB FTS index takes minutes and runs inside the
-    // scanner service's init, past its ready timeout; unlinking is instant.
-    db.close()
+  try {
+    return openExisting(path)
+  } catch (error) {
+    if (!isUnusableDatabaseError(error)) {
+      throw error
+    }
+    // One retry only: a second failure on a file we just created is not corruption.
     removeSessionSearchDatabase(path)
-    db = openWithPragmas(path)
+    return openExisting(path)
   }
-  db.exec(SCHEMA_SQL)
-  db.prepare('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)').run(
-    'schema_version',
-    String(SESSION_SEARCH_SCHEMA_VERSION)
+}
+
+function openExisting(path: string): SyncDatabase {
+  let db = openWithPragmas(path)
+  try {
+    // Only `stale`: a `fresh` file has nothing to throw away, and removing it
+    // would make every first open of a new profile a create-remove-create.
+    if (readSchemaState(db) === 'stale') {
+      // Why: DROP TABLE on a multi-GB FTS index takes minutes and runs inside the
+      // scanner service's init, past its ready timeout; unlinking is instant.
+      db.close()
+      removeSessionSearchDatabase(path)
+      db = openWithPragmas(path)
+    }
+    db.exec(SCHEMA_SQL)
+    db.prepare('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)').run(
+      'schema_version',
+      String(SESSION_SEARCH_SCHEMA_VERSION)
+    )
+    // Part of opening, not of using: a batch or staging session that outlived its
+    // writer has to be tombstoned before anything can read or write past it.
+    recoverSearchWrites(db)
+    return db
+  } catch (error) {
+    db.close()
+    throw error
+  }
+}
+
+// SQLite reports a torn file at the first statement that has to read a page, so
+// this has to match on the message as well as the code.
+const UNUSABLE_DATABASE =
+  /SQLITE_CORRUPT|SQLITE_NOTADB|file is not a database|database disk image is malformed/i
+
+function isUnusableDatabaseError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false
+  }
+  const code = (error as { code?: unknown }).code
+  return (
+    (typeof code === 'string' && UNUSABLE_DATABASE.test(code)) ||
+    UNUSABLE_DATABASE.test(error.message)
   )
-  return db
 }
 
 function openWithPragmas(path: string): SyncDatabase {
@@ -129,16 +179,21 @@ export function removeSessionSearchDatabase(path: string): void {
   }
 }
 
-function readSchemaVersion(db: SyncDatabase): number | null {
+/**
+ * `fresh` only when there is no `meta` table at all. A meta table whose version
+ * row is missing or unparseable is a damaged index, not a new one: seeding the
+ * current version over it would keep whatever rows the old schema left.
+ */
+function readSchemaState(db: SyncDatabase): 'fresh' | 'current' | 'stale' {
   const table = db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meta'")
     .get()
   if (!table) {
-    return null
+    return 'fresh'
   }
   const row = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as
     | { value: string }
     | undefined
   const parsed = row ? Number(row.value) : Number.NaN
-  return Number.isFinite(parsed) ? parsed : null
+  return parsed === SESSION_SEARCH_SCHEMA_VERSION ? 'current' : 'stale'
 }

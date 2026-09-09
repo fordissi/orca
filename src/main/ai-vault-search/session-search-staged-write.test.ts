@@ -8,6 +8,7 @@ import {
   replayTranscriptRead,
   syntheticCandidate,
   syntheticSession,
+  SYNTHETIC_TRANSCRIPT,
   userMessages,
   type SessionSearchIndexFile
 } from './session-search-staged-write-test-fixture'
@@ -132,6 +133,36 @@ it('recovers a batch its writer never finished when the store reopens', async ()
     await reopened.purgeOlderThan(null)
     expect(counts(index.db).rawMessages).toBe(0)
     expect(counts(index.db).batches).toBe(0)
+  } finally {
+    reopened.close()
+    store = new SessionSearchStore(index.path, (error) => errors.push(error))
+  }
+})
+
+it('retires a batch appended onto a live session when the writer dies', async () => {
+  replayTranscriptRead({ messages: userMessages('published', 3), outcome: { byteOffset: 100 } })
+  await store.settled()
+
+  const staged = store.beginWrite(syntheticCandidate(), 'append', 100)!
+  for (const message of userMessages('crashedappend', 200)) {
+    staged.add(message)
+  }
+  // No discard and no publish: the process died mid-append. The staged rows hang
+  // off a session that is published and must stay readable.
+  store.close()
+
+  const reopened = new SessionSearchStore(index.path, (error) => errors.push(error))
+  try {
+    expect(counts(index.db).messages).toBe(3)
+    expect(counts(index.db).sessions).toBe(1)
+    await reopened.purgeOlderThan(null)
+    // The appended rows are gone and the published generation survived them.
+    expect(counts(index.db).rawMessages).toBe(3)
+    expect(counts(index.db).batches).toBe(0)
+    expect(counts(index.db).tombstones).toBe(0)
+    expect(counts(index.db).full).toBe(3)
+    expect(counts(index.db).conversation).toBe(3)
+    expect(reopened.indexedFile(SYNTHETIC_TRANSCRIPT, null)?.byteOffset).toBe(100)
   } finally {
     reopened.close()
     store = new SessionSearchStore(index.path, (error) => errors.push(error))

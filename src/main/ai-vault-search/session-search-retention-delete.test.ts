@@ -51,6 +51,25 @@ function count(db: SyncDatabase, table: string): number {
   return (db.prepare(`SELECT count(*) AS n FROM ${table}`).get() as { n: number }).n
 }
 
+it('seeks the expiring end of the file list instead of scanning it', async () => {
+  const index = await openSessionSearchIndexFile('ss-retention-plan')
+  try {
+    seed(index.db, 1, 1, 1)
+    const plan = (
+      index.db
+        .prepare('EXPLAIN QUERY PLAN SELECT path FROM files WHERE mtime_ms < ? ORDER BY mtime_ms')
+        .all(100) as { detail: string }[]
+    )
+      .map((row) => row.detail)
+      .join(' ')
+    // Without files_mtime this is "SCAN files" plus a "USE TEMP B-TREE FOR ORDER BY".
+    expect(plan).toContain('files_mtime')
+    expect(plan).not.toContain('TEMP B-TREE')
+  } finally {
+    await index.close()
+  }
+})
+
 it('yields within a large file while hiding partial rows and preserving unrelated sessions', async () => {
   const index = await openSessionSearchIndexFile('ss-retention-yield')
   seed(index.db, 1, 1025, 1)

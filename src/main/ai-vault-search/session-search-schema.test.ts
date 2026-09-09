@@ -1,5 +1,5 @@
 import type * as NodeFs from 'node:fs'
-import { mkdtemp, stat, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -111,19 +111,120 @@ describe('openSessionSearchDatabase', () => {
   })
 })
 
-it('closes the SQLite handle when corrupt data fails initialization', async () => {
+it('rebuilds a file too corrupt to open instead of refusing forever', async () => {
+  const path = await tempDatabasePath()
+  const healthy = openSessionSearchDatabase(path)
+  healthy.prepare("INSERT INTO files(path,byte_offset,mtime_ms) VALUES ('a',1,1)").run()
+  healthy.close()
+  // A torn page, not a truncation: SQLite opens the header and fails on the read.
+  const bytes = await readFile(path)
+  bytes.fill(0x7f, 4096, Math.min(bytes.length, 12_288))
+  await writeFile(path, bytes)
+
+  const rebuilt = openSessionSearchDatabase(path)
+  try {
+    expect(schemaVersion(rebuilt)).toBe(String(SESSION_SEARCH_SCHEMA_VERSION))
+    expect(rebuilt.prepare('SELECT COUNT(*) AS c FROM files').get()).toEqual({ c: 0 })
+  } finally {
+    rebuilt.close()
+  }
+})
+
+it('rebuilds a file that is not a database at all', async () => {
   const path = await tempDatabasePath()
   await writeFile(path, 'not a SQLite database')
-  const close = vi.spyOn(SyncDatabase.prototype, 'close')
+
+  const rebuilt = openSessionSearchDatabase(path)
   try {
-    expect(() => openSessionSearchDatabase(path)).toThrow()
-    expect(close).toHaveBeenCalledTimes(1)
+    expect(schemaVersion(rebuilt)).toBe(String(SESSION_SEARCH_SCHEMA_VERSION))
   } finally {
-    close.mockRestore()
+    rebuilt.close()
   }
-  removeSessionSearchDatabase(path)
-  const recovered = openSessionSearchDatabase(path)
-  recovered.close()
+})
+
+it('gives up rather than looping when a fresh file still cannot be opened', async () => {
+  const path = await tempDatabasePath()
+  await writeFile(path, 'not a SQLite database')
+  // Every open of this path fails, so the one permitted retry is exhausted.
+  const open = vi.spyOn(SyncDatabase.prototype, 'pragma').mockImplementation(() => {
+    throw Object.assign(new Error('database disk image is malformed'), { code: 'SQLITE_CORRUPT' })
+  })
+  try {
+    expect(() => openSessionSearchDatabase(path)).toThrow(/malformed/)
+  } finally {
+    open.mockRestore()
+  }
+})
+
+it('rebuilds a newer index rather than reading a schema it does not know', async () => {
+  const path = await tempDatabasePath()
+  const newer = openSessionSearchDatabase(path)
+  newer.prepare("INSERT INTO files(path,byte_offset,mtime_ms) VALUES ('a',1,1)").run()
+  newer
+    .prepare("UPDATE meta SET value = ? WHERE key = 'schema_version'")
+    .run(String(SESSION_SEARCH_SCHEMA_VERSION + 1))
+  newer.close()
+
+  const rebuilt = openSessionSearchDatabase(path)
+  try {
+    expect(schemaVersion(rebuilt)).toBe(String(SESSION_SEARCH_SCHEMA_VERSION))
+    expect(rebuilt.prepare('SELECT COUNT(*) AS c FROM files').get()).toEqual({ c: 0 })
+  } finally {
+    rebuilt.close()
+  }
+})
+
+it('rebuilds when meta exists but its version row is gone', async () => {
+  const path = await tempDatabasePath()
+  const damaged = openSessionSearchDatabase(path)
+  damaged.prepare("INSERT INTO files(path,byte_offset,mtime_ms) VALUES ('a',1,1)").run()
+  // A meta table with no version is a damaged index, never a fresh one: seeding
+  // the current version over it would keep whatever the old schema left behind.
+  damaged.prepare("DELETE FROM meta WHERE key = 'schema_version'").run()
+  damaged.close()
+
+  const rebuilt = openSessionSearchDatabase(path)
+  try {
+    expect(schemaVersion(rebuilt)).toBe(String(SESSION_SEARCH_SCHEMA_VERSION))
+    expect(rebuilt.prepare('SELECT COUNT(*) AS c FROM files').get()).toEqual({ c: 0 })
+  } finally {
+    rebuilt.close()
+  }
+})
+
+it('opens with the pragmas the write path depends on', async () => {
+  const db = openSessionSearchDatabase(await tempDatabasePath())
+  try {
+    // auto_vacuum=2 is INCREMENTAL, and only takes on an empty file: without it
+    // a purge cannot hand pages back in bounded steps.
+    expect(Number(db.pragma('auto_vacuum', { simple: true }))).toBe(2)
+    expect(String(db.pragma('journal_mode', { simple: true })).toLowerCase()).toBe('wal')
+    expect(Number(db.pragma('synchronous', { simple: true }))).toBe(1)
+    // A WAL with no size limit never hands its space back after a large write.
+    expect(Number(db.pragma('journal_size_limit', { simple: true }))).toBe(8388608)
+    // Zero here turns every contended write into an immediate SQLITE_BUSY.
+    expect(Number(db.pragma('busy_timeout', { simple: true }))).toBe(5000)
+  } finally {
+    db.close()
+  }
+})
+
+it('retires an unfinished batch as part of opening, not of using', async () => {
+  const path = await tempDatabasePath()
+  const crashed = openSessionSearchDatabase(path)
+  crashed.exec(`INSERT INTO sessions(id,index_ready,agent,session_id,file_path,title,resume_command)
+    VALUES (1,0,'claude','a','a','staging','');
+    INSERT INTO search_write_batches(id,session_row_id) VALUES (7,1)`)
+  crashed.close()
+
+  const reopened = openSessionSearchDatabase(path)
+  try {
+    expect(reopened.prepare('SELECT count(*) AS n FROM search_pending_deletes').get()).toEqual({
+      n: 2
+    })
+  } finally {
+    reopened.close()
+  }
 })
 
 describe('visibility views', () => {

@@ -2,8 +2,24 @@ import type { AiVaultSession } from '../../shared/ai-vault-types'
 import type { SessionFileCandidate } from '../ai-vault/session-scanner-types'
 import type SyncDatabase from '../sqlite/sync-database'
 import { EMPTY_CONTENT_HASH, type SessionContentHash } from './session-search-content-hash'
+import { normalizeRuntimePathForComparison } from '../../shared/cross-platform-path'
 import { redactSessionSearchText } from './session-search-redaction'
-import { sessionSearchPathKey } from './session-search-path-key'
+
+/**
+ * The stored comparison key for a session's working directory.
+ *
+ * Why the shared normalizer verbatim: the sidebar already groups sessions by
+ * `folderGroupKey`, which is this function under a prefix. A second spelling
+ * here means any later join between an indexed hit and a sidebar group returns
+ * nothing. An earlier version qualified a WSL cwd with its distro so two
+ * distros could not collide at `/home/me/repo`; that is a real collision, but it
+ * is one every SSH host has too, neither key qualifies for SSH, and the fix for
+ * it is a column that names the execution host, not a path key that only some
+ * hosts spell differently.
+ */
+export function cwdKey(cwd: string | null): string | null {
+  return cwd ? normalizeRuntimePathForComparison(cwd) : null
+}
 
 export class SessionSearchFileRecords {
   constructor(private readonly db: SyncDatabase) {}
@@ -31,7 +47,7 @@ export class SessionSearchFileRecords {
       session.codexHome,
       redactSessionSearchText(session.title),
       session.cwd,
-      session.cwd ? sessionSearchPathKey(session.cwd, session.filePath) : null,
+      cwdKey(session.cwd),
       session.branch,
       session.createdAt,
       session.updatedAt,
